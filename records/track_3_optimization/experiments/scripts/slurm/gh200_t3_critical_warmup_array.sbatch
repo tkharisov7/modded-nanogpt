@@ -24,5 +24,10 @@ export WANDB_PROJECT="${WANDB_PROJECT:-modded-nanogpt-track3}"
 export WANDB_GROUP="${WANDB_GROUP:-T3_CRITICAL_WARMUP_GH200_${SLURM_ARRAY_JOB_ID}}"
 export STOP_STEP="${STOP_STEP:-2720}"
 export CANDIDATES_PER_NODE="${CANDIDATES_PER_NODE:-4}"
+export REPO_ROOT="${REPO_ROOT:-/capstor/store/cscs/uba/uba02/modded-nanogpt}"
 
-bash records/track_3_optimization/experiments/scripts/slurm/t3_critical_warmup_array_body.sh
+srun --environment=t3-nanogpt bash -lc '
+  source /capstor/store/cscs/uba/uba02/venvs/t3-ngc-pt-25.06/bin/activate
+  cd "${REPO_ROOT}"
+  bash records/track_3_optimization/experiments/scripts/slurm/t3_critical_warmup_array_body.sh
+'
