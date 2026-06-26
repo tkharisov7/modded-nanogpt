@@ -26,6 +26,17 @@ export STOP_STEP="${STOP_STEP:-2720}"
 export CANDIDATES_PER_NODE="${CANDIDATES_PER_NODE:-4}"
 export REPO_ROOT="${REPO_ROOT:-/capstor/store/cscs/uba/uba02/modded-nanogpt}"
 
+if [[ "${WANDB_MODE}" == "online" && -z "${WANDB_API_KEY:-}" && -f "${HOME}/.netrc" ]]; then
+  export WANDB_API_KEY
+  WANDB_API_KEY="$(
+    awk '
+      $1 == "machine" && $2 == "api.wandb.ai" { in_wandb = 1; next }
+      $1 == "machine" { in_wandb = 0 }
+      in_wandb && $1 == "password" { print $2; exit }
+    ' "${HOME}/.netrc"
+  )"
+fi
+
 srun --environment=t3-nanogpt bash -lc '
   source /capstor/store/cscs/uba/uba02/venvs/t3-ngc-pt-25.06/bin/activate
   cd "${REPO_ROOT}"
