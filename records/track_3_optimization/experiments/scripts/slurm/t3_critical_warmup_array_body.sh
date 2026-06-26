@@ -88,7 +88,7 @@ run_candidate() {
   echo "[$(date --iso-8601=seconds)] launching candidate_index=${candidate_index} gpu_slot=${gpu_slot} schedule_kind=${schedule_kind} warmup_steps=${warmup_steps} muon_lr_mult=${muon_lr_mult} seed=${seed} log_file=${log_file}"
 
   local train_cmd=(
-    torchrun --standalone --nproc_per_node=1
+    python -m torch.distributed.run --standalone --nproc_per_node=1
     records/track_3_optimization/experiments/train_gpt_critical_warmup.py
     --seed "${seed}"
     --schedule-kind "${schedule_kind}"
