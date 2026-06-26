@@ -1,0 +1,86 @@
+{
+  "name": "T3_critical_warmup_lr_push_v1",
+  "method": "grid",
+  "metric": {
+    "name": "val_ema_loss_at_claim_step",
+    "goal": "minimize"
+  },
+  "parameters": {
+    "study_id": {
+      "values": [
+        "T3_CRITICAL_WARMUP_LR_PUSH_V1"
+      ]
+    },
+    "base_record": {
+      "values": [
+        "20260619_cwd_rowfloor_tailema"
+      ]
+    },
+    "schedule_kind": {
+      "values": [
+        "baseline",
+        "linear",
+        "critical_table",
+        "catapult_proxy"
+      ]
+    },
+    "warmup_target": {
+      "values": [
+        "muon_hidden_only"
+      ]
+    },
+    "warmup_steps": {
+      "values": [
+        25,
+        50,
+        100
+      ]
+    },
+    "muon_lr_mult": {
+      "values": [
+        1.0,
+        1.05,
+        1.1,
+        1.15,
+        1.2
+      ]
+    },
+    "aux_lr_mult": {
+      "values": [
+        1.0
+      ]
+    },
+    "final_schedule_steps": {
+      "values": [
+        2900
+      ]
+    },
+    "final_lr_power": {
+      "values": [
+        1.2
+      ]
+    },
+    "stop_step": {
+      "values": [
+        2720
+      ]
+    },
+    "seed": {
+      "values": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    "nproc_per_node": {
+      "values": [
+        1
+      ]
+    }
+  }
+}
