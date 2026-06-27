@@ -13,6 +13,7 @@ WANDB_PROJECT="${WANDB_PROJECT:-modded-nanogpt-track3}"
 WANDB_GROUP="${WANDB_GROUP:-T3_CRITICAL_WARMUP_GH200_${SLURM_ARRAY_JOB_ID:-manual}}"
 CONTAINER_RUN_PREFIX="${CONTAINER_RUN_PREFIX:-}"
 CANDIDATES_PER_NODE="${CANDIDATES_PER_NODE:-4}"
+GRID_PRESET="${GRID_PRESET:-full_v1}"
 
 if [[ "${WANDB_MODE}" == "online" && -z "${WANDB_API_KEY:-}" && -f "${HOME}/.netrc" ]]; then
   export WANDB_API_KEY
@@ -47,19 +48,51 @@ add_candidate() {
   CANDIDATES+=("${schedule_kind},${warmup_steps},${muon_lr_mult},${seed}")
 }
 
-for seed in 0 1 2 3 4 5 6 7; do
-  add_candidate baseline 0 1.0 "${seed}"
-done
+add_cell() {
+  local schedule_kind="$1"
+  local warmup_steps="$2"
+  local muon_lr_mult="$3"
+  for seed in 0 1 2 3 4 5 6 7; do
+    add_candidate "${schedule_kind}" "${warmup_steps}" "${muon_lr_mult}" "${seed}"
+  done
+}
 
-for schedule_kind in linear critical_table catapult_proxy; do
-  for warmup_steps in 25 50 100; do
-    for muon_lr_mult in 1.0 1.05 1.1 1.15 1.2; do
-      for seed in 0 1 2 3 4 5 6 7; do
-        add_candidate "${schedule_kind}" "${warmup_steps}" "${muon_lr_mult}" "${seed}"
+case "${GRID_PRESET}" in
+  full_v1)
+    for seed in 0 1 2 3 4 5 6 7; do
+      add_candidate baseline 0 1.0 "${seed}"
+    done
+
+    for schedule_kind in linear critical_table catapult_proxy; do
+      for warmup_steps in 25 50 100; do
+        for muon_lr_mult in 1.0 1.05 1.1 1.15 1.2; do
+          for seed in 0 1 2 3 4 5 6 7; do
+            add_candidate "${schedule_kind}" "${warmup_steps}" "${muon_lr_mult}" "${seed}"
+          done
+        done
       done
     done
-  done
-done
+    ;;
+  catapult_critical_high_v1)
+    add_cell critical_table 25 1.20
+    add_cell critical_table 25 1.25
+    add_cell critical_table 25 1.30
+    add_cell critical_table 25 1.35
+    add_cell critical_table 50 1.20
+    add_cell critical_table 50 1.25
+
+    add_cell catapult_proxy 25 1.10
+    add_cell catapult_proxy 25 1.15
+    add_cell catapult_proxy 25 1.20
+    add_cell catapult_proxy 25 1.25
+    add_cell catapult_proxy 25 1.30
+    add_cell catapult_proxy 50 1.25
+    ;;
+  *)
+    echo "Unsupported GRID_PRESET=${GRID_PRESET}" >&2
+    exit 1
+    ;;
+esac
 
 START_INDEX=$((SLURM_ARRAY_TASK_ID * CANDIDATES_PER_NODE))
 if (( START_INDEX < 0 || START_INDEX >= ${#CANDIDATES[@]} )); then
@@ -85,6 +118,7 @@ else
 fi
 echo "container_run_prefix=${CONTAINER_RUN_PREFIX}"
 echo "candidates_per_node=${CANDIDATES_PER_NODE}"
+echo "grid_preset=${GRID_PRESET}"
 echo "candidate_count=${#CANDIDATES[@]}"
 echo "start_index=${START_INDEX}"
 
