@@ -14,6 +14,23 @@ WANDB_GROUP="${WANDB_GROUP:-T3_CRITICAL_WARMUP_GH200_${SLURM_ARRAY_JOB_ID:-manua
 CONTAINER_RUN_PREFIX="${CONTAINER_RUN_PREFIX:-}"
 CANDIDATES_PER_NODE="${CANDIDATES_PER_NODE:-4}"
 
+if [[ "${WANDB_MODE}" == "online" && -z "${WANDB_API_KEY:-}" && -f "${HOME}/.netrc" ]]; then
+  export WANDB_API_KEY
+  WANDB_API_KEY="$(
+    awk '
+      $1 == "machine" { in_wandb = ($2 == "api.wandb.ai") }
+      in_wandb {
+        for (i = 1; i <= NF; i++) {
+          if ($i == "password" && i < NF) {
+            print $(i + 1)
+            exit
+          }
+        }
+      }
+    ' "${HOME}/.netrc"
+  )"
+fi
+
 if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   echo "SLURM_ARRAY_TASK_ID is required." >&2
   exit 1
@@ -61,6 +78,11 @@ echo "micro_batch_size=${MICRO_BATCH_SIZE}"
 echo "wandb_mode=${WANDB_MODE}"
 echo "wandb_project=${WANDB_PROJECT}"
 echo "wandb_group=${WANDB_GROUP}"
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+  echo "wandb_api_key_configured=yes"
+else
+  echo "wandb_api_key_configured=no"
+fi
 echo "container_run_prefix=${CONTAINER_RUN_PREFIX}"
 echo "candidates_per_node=${CANDIDATES_PER_NODE}"
 echo "candidate_count=${#CANDIDATES[@]}"
