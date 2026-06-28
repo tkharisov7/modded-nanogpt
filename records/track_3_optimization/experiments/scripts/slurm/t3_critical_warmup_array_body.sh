@@ -88,6 +88,20 @@ case "${GRID_PRESET}" in
     add_cell catapult_proxy 25 1.30
     add_cell catapult_proxy 50 1.25
     ;;
+  critical_short_nocool_v1)
+    add_cell critical_table 5 1.20
+    add_cell critical_table 5 1.30
+    add_cell critical_table 5 1.40
+    add_cell critical_table 10 1.20
+    add_cell critical_table 10 1.30
+    add_cell critical_table 10 1.40
+    add_cell critical_table 15 1.20
+    add_cell critical_table 15 1.30
+    add_cell critical_table 15 1.40
+    add_cell critical_table 20 1.20
+    add_cell critical_table 20 1.30
+    add_cell critical_table 20 1.40
+    ;;
   *)
     echo "Unsupported GRID_PRESET=${GRID_PRESET}" >&2
     exit 1
