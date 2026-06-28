@@ -14,12 +14,18 @@ NAME_RE = re.compile(
 
 
 COLORS = {
-    ("1.05", "2685"): "#2ca02c",
-    ("1.05", "2690"): "#9467bd",
-    ("1.10", "2685"): "#d62728",
-    ("1.10", "2690"): "#8c564b",
-    ("1.15", "2685"): "#17becf",
-    ("1.15", "2690"): "#e377c2",
+    (10, "1.05", "2685"): "#2ca02c",
+    (10, "1.05", "2690"): "#9467bd",
+    (10, "1.10", "2685"): "#d62728",
+    (10, "1.10", "2690"): "#8c564b",
+    (10, "1.15", "2685"): "#17becf",
+    (10, "1.15", "2690"): "#e377c2",
+    (20, "1.05", "2685"): "#1b9e77",
+    (20, "1.05", "2690"): "#7570b3",
+    (20, "1.10", "2685"): "#e7298a",
+    (20, "1.10", "2690"): "#a6761d",
+    (20, "1.15", "2685"): "#66a61e",
+    (20, "1.15", "2690"): "#666666",
 }
 
 
@@ -69,6 +75,23 @@ def draw_run(points, color, opacity, width, radius, xy):
     return out
 
 
+def draw_mean(points, color, opacity, width, radius, dash, xy):
+    if len(points) == 0:
+        return []
+    dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
+    out = [
+        f'<polyline points="{polyline(points, xy)}" fill="none" stroke="{color}" '
+        f'stroke-width="{width}" stroke-linecap="round" stroke-linejoin="round" opacity="{opacity}"{dash_attr}/>'
+    ]
+    for step, loss in points:
+        x, y = xy(step, loss)
+        out.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius}" fill="{color}" '
+            f'stroke="white" stroke-width="1.2" opacity="{opacity}"/>'
+        )
+    return out
+
+
 def average_curves(runs):
     by_step = defaultdict(list)
     for points in runs:
@@ -97,7 +120,7 @@ def main():
             continue
         points = parse_log(path)
         meta = m.groupdict()
-        key = (meta["mult"], meta["cooldown"])
+        key = (meta["warmup"], meta["mult"], meta["cooldown"])
         if points:
             grouped[key].append((path.name, points, meta))
             parsed_runs.append((path.name, points, meta))
@@ -120,14 +143,15 @@ def main():
     for key in sorted(grouped):
         color = COLORS.get(key, "#444444")
         avg = average_curves([points for _name, points, _meta in grouped[key]])
-        elements.extend(draw_run(avg, color, opacity="0.95", width="5.0", radius="5.2", xy=xy))
+        dash = "12 8" if key[0] == 20 else ""
+        elements.extend(draw_mean(avg, color, opacity="0.95", width="5.0", radius="5.2", dash=dash, xy=xy))
         max_step = max(step for _name, points, _meta in grouped[key] for step, _loss in points)
         n = len(grouped[key])
         legend_rows.append((key, color, n, max_step))
 
     # Compact legend in the lower-left plot area, away from the original legend and main endpoint.
     legend_x, legend_y = 205, 760
-    row_h = 26
+    row_h = 24
     legend_h = 44 + row_h * len(legend_rows)
     elements.append(
         f'<rect x="{legend_x - 12}" y="{legend_y - 28}" width="500" height="{legend_h}" '
@@ -139,8 +163,9 @@ def main():
     )
     for i, (key, color, n, max_step) in enumerate(legend_rows, start=1):
         y = legend_y + 10 + i * row_h
-        label = f"m={key[0]}, c={key[1]}: mean + {n} runs, latest {max_step}"
-        elements.append(f'<line x1="{legend_x}" y1="{y - 7}" x2="{legend_x + 50}" y2="{y - 7}" stroke="{color}" stroke-width="5" stroke-linecap="round"/>')
+        label = f"w={key[0]}, m={key[1]}, c={key[2]}: mean + {n} runs, latest {max_step}"
+        dash_attr = ' stroke-dasharray="12 8"' if key[0] == 20 else ""
+        elements.append(f'<line x1="{legend_x}" y1="{y - 7}" x2="{legend_x + 50}" y2="{y - 7}" stroke="{color}" stroke-width="5" stroke-linecap="round"{dash_attr}/>')
         elements.append(f'<circle cx="{legend_x + 25}" cy="{y - 7}" r="5.2" fill="{color}" stroke="white" stroke-width="1.2"/>')
         elements.append(
             f'<text x="{legend_x + 64}" y="{y}" font-family="DejaVu Sans, Arial, sans-serif" '
@@ -172,7 +197,7 @@ def main():
     print(f"plotted_runs={len(parsed_runs)}")
     for key in sorted(grouped):
         latest = max(step for _name, points, _meta in grouped[key] for step, _loss in points)
-        print(f"group m={key[0]} c={key[1]} runs={len(grouped[key])} latest_step={latest}")
+        print(f"group w={key[0]} m={key[1]} c={key[2]} runs={len(grouped[key])} latest_step={latest}")
     if no_validation:
         print("no_validation_yet=" + ",".join(no_validation))
 
