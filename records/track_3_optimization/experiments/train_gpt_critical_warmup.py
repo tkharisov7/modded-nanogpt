@@ -62,7 +62,7 @@ torch.backends.cuda.enable_cudnn_sdp(False)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--schedule-kind", choices=["baseline", "linear", "critical_table", "catapult_proxy"], default=os.environ.get("SCHEDULE_KIND", "baseline"))
+parser.add_argument("--schedule-kind", choices=["baseline", "linear", "critical_table", "catapult_proxy", "adaptive_critical_lr"], default=os.environ.get("SCHEDULE_KIND", "baseline"))
 parser.add_argument("--warmup-steps", type=int, default=int(os.environ.get("WARMUP_STEPS", "0")))
 parser.add_argument("--warmup-target", choices=["muon_hidden_only"], default=os.environ.get("WARMUP_TARGET", "muon_hidden_only"))
 parser.add_argument("--muon-lr-mult", type=float, default=float(os.environ.get("MUON_LR_MULT", "1.0")))
@@ -72,6 +72,11 @@ parser.add_argument("--data-dir", type=Path, default=Path(os.environ.get("DATA_D
 parser.add_argument("--micro-batch-size", type=int, default=int(os.environ.get("MICRO_BATCH_SIZE", "64")))
 parser.add_argument("--final-schedule-steps", type=int, default=int(os.environ.get("FINAL_SCHEDULE_STEPS", "2900")))
 parser.add_argument("--final-lr-power", type=float, default=float(os.environ.get("FINAL_LR_POWER", "1.2")))
+parser.add_argument("--cooldown-start-offset", type=int, default=int(os.environ.get("COOLDOWN_START_OFFSET", "0")))
+parser.add_argument("--critical-lr-search-max", type=float, default=float(os.environ.get("CRITICAL_LR_SEARCH_MAX", str(10 * 0.0375))))
+parser.add_argument("--critical-lr-tol-power", type=int, default=int(os.environ.get("CRITICAL_LR_TOL_POWER", "6")))
+parser.add_argument("--critical-lr-exp-max-iters", type=int, default=int(os.environ.get("CRITICAL_LR_EXP_MAX_ITERS", "40")))
+parser.add_argument("--critical-lr-max-iters", type=int, default=int(os.environ.get("CRITICAL_LR_MAX_ITERS", "80")))
 parser.add_argument("--wandb-mode", choices=["disabled", "online", "offline"], default=os.environ.get("WANDB_MODE", "disabled"))
 parser.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT", "modded-nanogpt-track3"))
 parser.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY"))
@@ -466,6 +471,88 @@ class Muon(torch.optim.Optimizer):
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
         super().__init__(params, defaults)
 
+    def _init_state(self, p: Tensor, state):
+        if len(state) == 0:
+            state["momentum"] = torch.zeros_like(p)
+            if p in self.soap_params:
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+                state["row_gg"] = torch.zeros(p.size(0), p.size(0), dtype=torch.float32, device=p.device)
+                state["col_gg"] = torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device)
+                state["q_row"] = None
+                state["q_col"] = None
+                state["soap_step"] = 0
+
+    def _clone_state(self, state):
+        cloned = {}
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                cloned[key] = value.detach().clone()
+            else:
+                cloned[key] = value
+        return cloned
+
+    def _apply_one_param(self, p: Tensor, group, state, lr: float, update_preconditioner: bool):
+        grad = p.grad
+        if grad is None:
+            return
+        state["momentum"].lerp_(grad, 1 - group["mu"])
+        momentum_update = grad.lerp(state["momentum"], group["mu"])
+        is_attn_soap = p in self.attn_soap_params
+        use_soap = p in self.soap_params
+        if use_soap:
+            if is_attn_soap:
+                soap_update = soap_precondition_momentum(momentum_update, state)
+                if p in self.attn_proj_soap_params:
+                    gate = bounded_trust_gate(
+                        trust_gate(momentum_update, soap_update, grad),
+                        self.step_count
+                    )
+                else:
+                    gate = torch.ones((), dtype=torch.float32, device=p.device)
+                momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
+            else:
+                momentum_update = soap_precondition_momentum(momentum_update, state)
+        update = muon_update(momentum_update)
+        update = scale_radial_update(update, p)
+        p_fro = p.float().norm().clamp_min(1e-8)
+        u_fro = update.float().norm().clamp_min(1e-8)
+        cur_uw = u_fro / p_fro
+        target_uw = SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW
+        if ROWFLOOR and p.ndim == 2:
+            r_row = p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)
+            s_row = update.float().norm(dim=1, keepdim=True).clamp_min(1e-8)
+            f_row = torch.clamp(target_uw * r_row / s_row, min=1.0).pow(ROWFLOOR_RHO)
+            update = (update.float() * f_row).to(update.dtype)
+        else:
+            scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
+            update = update * scale.to(update.dtype)
+        target_radius = target_radius_after_update(p, update, lr)
+        if CWD > 0.0 and p.ndim == 2:
+            cwd_mask = (update.float() * p.float() > 0).to(p.dtype)
+        p.add_(update, alpha=-lr)
+        rescale_to_radius(p, target_radius)
+        if CWD > 0.0 and p.ndim == 2:
+            p.mul_(1.0 - (lr * CWD) * cwd_mask)
+        if update_preconditioner and use_soap:
+            soap_update_preconditioner(grad, state)
+
+    @torch.no_grad()
+    def virtual_loss_at_lr(self, lr: float, loss_fn):
+        if dist.get_world_size() != 1:
+            raise RuntimeError("adaptive_critical_lr virtual probes currently require one rank per training run.")
+        stashed_params = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                self._init_state(p, self.state[p])
+                stashed_params.append((p, p.detach().clone()))
+                trial_state = self._clone_state(self.state[p])
+                self._apply_one_param(p, group, trial_state, lr, update_preconditioner=False)
+        try:
+            return loss_fn()
+        finally:
+            for p, old in stashed_params:
+                p.copy_(old)
+
     @torch.no_grad()
     def step(self):
         world_size = dist.get_world_size()
@@ -477,64 +564,8 @@ class Muon(torch.optim.Optimizer):
                 if base_i + rank < len(params):
                     p = params[base_i + rank]
                     state = self.state[p]
-                    if len(state) == 0:
-                        state["momentum"] = torch.zeros_like(p)
-                        if p in self.soap_params:
-                            state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
-                            state["row_gg"] = torch.zeros(p.size(0), p.size(0), dtype=torch.float32, device=p.device)
-                            state["col_gg"] = torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device)
-                            state["q_row"] = None
-                            state["q_col"] = None
-                            state["soap_step"] = 0
-                    grad = p.grad
-                    state["momentum"].lerp_(grad, 1 - group["mu"])
-                    momentum_update = grad.lerp(state["momentum"], group["mu"])
-                    is_attn_soap = p in self.attn_soap_params
-                    use_soap = p in self.soap_params
-                    if use_soap:
-                        if is_attn_soap:
-                            soap_update = soap_precondition_momentum(momentum_update, state)
-                            if p in self.attn_proj_soap_params:
-                                gate = bounded_trust_gate(
-                                    trust_gate(momentum_update, soap_update, grad),
-                                    self.step_count
-                                )
-                            else:
-                                gate = torch.ones((), dtype=torch.float32, device=p.device)
-                            momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
-                        else:
-                            momentum_update = soap_precondition_momentum(momentum_update, state)
-                    update = muon_update(momentum_update)
-                    update = scale_radial_update(update, p)
-                    # u/w-floor. SOAP and non-SOAP params can use different floors.
-                    p_fro = p.float().norm().clamp_min(1e-8)
-                    u_fro = update.float().norm().clamp_min(1e-8)
-                    cur_uw = u_fro / p_fro
-                    target_uw = SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW
-                    if ROWFLOOR and p.ndim == 2:
-                        # (B) RowFloor: boost each under-updated OUTPUT ROW to its target update/weight
-                        # ratio. Per-row SHAPE change; magnitude is re-pinned below, so only the shape
-                        # survives the radius pin. RHO=1.0 -> the clamp is the whole floor.
-                        r_row = p.float().norm(dim=1, keepdim=True).clamp_min(1e-8)
-                        s_row = update.float().norm(dim=1, keepdim=True).clamp_min(1e-8)
-                        f_row = torch.clamp(target_uw * r_row / s_row, min=1.0).pow(ROWFLOOR_RHO)
-                        update = (update.float() * f_row).to(update.dtype)
-                    else:
-                        scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
-                        update = update * scale.to(update.dtype)
-                    target_radius = target_radius_after_update(p, update, group["lr"])
-                    # WD set to 0 — u/w target replaces wd's role (smaller updates as p grows).
-                    if CWD > 0.0 and p.ndim == 2:
-                        # (C) Cautious Weight Decay: mask the coords where -lr*update already shrinks |p|
-                        # (update*p>0); decay only those (never fight a coord the optimizer wants to grow).
-                        cwd_mask = (update.float() * p.float() > 0).to(p.dtype)
-                    p.add_(update, alpha=-group["lr"])
-                    rescale_to_radius(p, target_radius)
-                    if CWD > 0.0 and p.ndim == 2:
-                        # apply AFTER the radius pin (POST) so the per-coord shape change is preserved.
-                        p.mul_(1.0 - (group["lr"] * CWD) * cwd_mask)
-                    if use_soap:
-                        soap_update_preconditioner(grad, state)
+                    self._init_state(p, state)
+                    self._apply_one_param(p, group, state, group["lr"], update_preconditioner=True)
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
         self.step_count += 1
 
@@ -721,6 +752,11 @@ print0(f"Using aux_lr_mult={args.aux_lr_mult}")
 print0(f"Using micro_batch_size={args.micro_batch_size}")
 print0(f"Using final_schedule_steps={FINAL_SCHEDULE_STEPS}")
 print0(f"Using final_lr_power={FINAL_LR_POWER}")
+print0(f"Using cooldown_start_offset={args.cooldown_start_offset}")
+print0(f"Using critical_lr_search_max={args.critical_lr_search_max}")
+print0(f"Using critical_lr_tol_power={args.critical_lr_tol_power}")
+print0(f"Using critical_lr_exp_max_iters={args.critical_lr_exp_max_iters}")
+print0(f"Using critical_lr_max_iters={args.critical_lr_max_iters}")
 print0(f"Using stop_step={STOP_STEP}")
 print0(f"Using wandb_mode={args.wandb_mode}")
 print0("SOAP runs on all all_hidden matrices for the whole run at frequency 1.")
@@ -768,6 +804,11 @@ if dist.get_rank() == 0 and args.wandb_mode != "disabled":
             "aux_lr_mult": args.aux_lr_mult,
             "final_schedule_steps": FINAL_SCHEDULE_STEPS,
             "final_lr_power": FINAL_LR_POWER,
+            "cooldown_start_offset": args.cooldown_start_offset,
+            "critical_lr_search_max": args.critical_lr_search_max,
+            "critical_lr_tol_power": args.critical_lr_tol_power,
+            "critical_lr_exp_max_iters": args.critical_lr_exp_max_iters,
+            "critical_lr_max_iters": args.critical_lr_max_iters,
             "stop_step": STOP_STEP,
             "data_dir": str(args.data_dir),
         },
@@ -797,7 +838,7 @@ train_steps = FINAL_TRAIN_STEPS
 # so evals at steps <= STOP_STEP are IDENTICAL to the full run). Target boundary ~2775 only needs evals
 # up to ~2800-2850, so STOP_STEP=2850 saves the unused 2850-2900 tail. Default = full run.
 val_regular_interval = 125
-extra_val_steps = {2700, 2705, 2710, 2715, 2720, 2725, 2730, 2735, 2740, 2745, 2750, 2755, 2760, 2765, 2770, 2775, 2780, 2785, 2790, 2795, 2800, 2805, 2810, 2820, 2830, 2840, 2850, 2860, 2870, 2880, 2890, 2895, 2900, 2910, 2920, 2930, 2940, 2950, 2960, 2965, 2970, 2975, 2980, 2985, 2990, 2995, 2999, 3000, 3010, 3020}
+extra_val_steps = {2680, 2685, 2690, 2695, 2700, 2705, 2710, 2715, 2720, 2725, 2730, 2735, 2740, 2745, 2750, 2755, 2760, 2765, 2770, 2775, 2780, 2785, 2790, 2795, 2800, 2805, 2810, 2820, 2830, 2840, 2850, 2860, 2870, 2880, 2890, 2895, 2900, 2910, 2920, 2930, 2940, 2950, 2960, 2965, 2970, 2975, 2980, 2985, 2990, 2995, 2999, 3000, 3010, 3020}
 
 # initialize model parameters
 for name, p in model.named_parameters():
@@ -914,6 +955,12 @@ optimizer2.param_groups[0]["power_c"] = MUON_POWER_C
 def _lr(step, initial_lr, power_c, power=1.0):
     t_end = FINAL_SCHEDULE_STEPS
     flat_lr = initial_lr
+    if args.cooldown_start_offset > 0:
+        cd_start = max(0, t_end - args.cooldown_start_offset)
+        if step < cd_start:
+            return flat_lr
+        frac = max(0.0, (t_end - step) / max(args.cooldown_start_offset, 1))
+        return flat_lr * frac ** power
     downward_lr = power_c * max(0.0, t_end - step) ** power
     return min(flat_lr, downward_lr)
 
@@ -929,7 +976,7 @@ def _interp_piecewise(x: float, points):
     return points[-1][1]
 
 def warmup_multiplier(step: int) -> float:
-    if args.schedule_kind == "baseline" or args.warmup_steps <= 0:
+    if args.schedule_kind in ("baseline", "adaptive_critical_lr") or args.warmup_steps <= 0:
         return 1.0
     progress = min(max((step + 1) / args.warmup_steps, 0.0), 1.0)
     if args.schedule_kind == "linear":
@@ -992,6 +1039,143 @@ def set_hparams(step):
         group["mu"] = mu
 
 
+def batch_loss_no_grad(inputs: Tensor, targets: Tensor) -> float:
+    prev_training = model.training
+    model.eval()
+    loss = torch.zeros((), device=device)
+    with torch.no_grad():
+        for i in range(len(inputs) // mbs):
+            loss += model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+    model.train(prev_training)
+    return float(loss.item())
+
+
+def adaptive_critical_lr_for_batch(step: int, inputs: Tensor, targets: Tensor):
+    if args.schedule_kind != "adaptive_critical_lr" or step >= args.warmup_steps:
+        return None
+    if dist.get_world_size() != 1:
+        raise RuntimeError("adaptive_critical_lr currently supports one rank per run.")
+
+    current_loss = batch_loss_no_grad(inputs, targets)
+    max_lr = float(args.critical_lr_search_max)
+    min_lr = 1e-12
+    exp_cap = max(1, int(args.critical_lr_exp_max_iters))
+    max_iters = max(1, int(args.critical_lr_max_iters))
+    lr = max(min_lr, min(max_lr, float(optimizer2.param_groups[0]["lr"])))
+    iterations = 0
+    exp_iterations = 0
+
+    def loss_at(trial_lr: float) -> float:
+        return float(optimizer2.virtual_loss_at_lr(trial_lr, lambda: batch_loss_no_grad(inputs, targets)))
+
+    def is_safe(loss_value: float) -> bool:
+        return loss_value <= current_loss
+
+    loss_guess = loss_at(lr)
+    iterations += 1
+    exp_iterations += 1
+    search_hit_max = False
+    search_hit_exp_cap = False
+
+    if is_safe(loss_guess):
+        safe_lr = lr
+        safe_loss = loss_guess
+        unsafe_lr = max_lr
+        unsafe_loss = float("nan")
+        cursor = lr
+        found_unsafe = False
+        while iterations < max_iters and exp_iterations < exp_cap and cursor < max_lr:
+            candidate = min(max_lr, cursor * 2.0)
+            if candidate <= cursor:
+                break
+            loss_candidate = loss_at(candidate)
+            iterations += 1
+            exp_iterations += 1
+            if not is_safe(loss_candidate):
+                unsafe_lr = candidate
+                unsafe_loss = loss_candidate
+                found_unsafe = True
+                break
+            safe_lr = candidate
+            safe_loss = loss_candidate
+            cursor = candidate
+        if not found_unsafe:
+            unsafe_lr = safe_lr
+            unsafe_loss = safe_loss
+            search_hit_max = safe_lr >= max_lr
+            search_hit_exp_cap = exp_iterations >= exp_cap and safe_lr < max_lr
+    else:
+        unsafe_lr = lr
+        unsafe_loss = loss_guess
+        safe_lr = 0.0
+        safe_loss = current_loss
+        cursor = lr
+        found_safe = False
+        while iterations < max_iters and exp_iterations < exp_cap and cursor > min_lr:
+            candidate = max(min_lr, cursor / 2.0)
+            if candidate >= cursor:
+                break
+            loss_candidate = loss_at(candidate)
+            iterations += 1
+            exp_iterations += 1
+            if is_safe(loss_candidate):
+                safe_lr = candidate
+                safe_loss = loss_candidate
+                found_safe = True
+                break
+            unsafe_lr = candidate
+            unsafe_loss = loss_candidate
+            cursor = candidate
+        if not found_safe:
+            safe_lr = cursor
+            safe_loss = unsafe_loss
+            unsafe_lr = cursor
+            search_hit_exp_cap = exp_iterations >= exp_cap and cursor > min_lr
+
+    tol = 1.0 / (2 ** max(int(args.critical_lr_tol_power), 1))
+    while unsafe_lr > 0 and safe_lr < unsafe_lr and (1.0 - safe_lr / unsafe_lr) > tol and iterations < max_iters:
+        mid = 0.5 * (safe_lr + unsafe_lr)
+        loss_mid = loss_at(mid)
+        iterations += 1
+        if is_safe(loss_mid):
+            safe_lr = mid
+            safe_loss = loss_mid
+        else:
+            unsafe_lr = mid
+            unsafe_loss = loss_mid
+
+    midpoint_lr = 0.5 * (safe_lr + unsafe_lr)
+    optimizer2.param_groups[0]["lr"] = midpoint_lr
+    trace = {
+        "event": "adaptive_critical_lr",
+        "step": step,
+        "current_loss": current_loss,
+        "lower_lr": safe_lr,
+        "upper_lr": unsafe_lr,
+        "midpoint_lr": midpoint_lr,
+        "virtual_loss_lower": safe_loss,
+        "virtual_loss_upper": unsafe_loss,
+        "search_hit_max": search_hit_max,
+        "search_hit_exp_cap": search_hit_exp_cap,
+        "iterations": iterations,
+        "exp_iterations": exp_iterations,
+        "critical_lr_search_max": max_lr,
+        "post_warmup_scale": args.muon_lr_mult,
+    }
+    print0("CRITICAL_LR_JSON " + json.dumps(trace, sort_keys=True), console=True)
+    wandb_log({
+        "critical_lr/lower_lr": safe_lr,
+        "critical_lr/upper_lr": unsafe_lr,
+        "critical_lr/midpoint_lr": midpoint_lr,
+        "critical_lr/current_loss": current_loss,
+        "critical_lr/search_hit_max": int(search_hit_max),
+        "critical_lr/search_hit_exp_cap": int(search_hit_exp_cap),
+        "critical_lr/iterations": iterations,
+    }, step)
+    return trace
+
+
 
 
 ########################################
@@ -1004,6 +1188,7 @@ for p in model.parameters():
 training_time = 0
 _tailema = None   # (A) Tail-EMA buffer: one fp32 tensor per non-embed param; lazy-init at TAILEMA_START
 first_val_ema_below_3p28 = None
+last_critical_lr_trace = None
 dist.barrier()
 t0 = time.perf_counter()
 for step in range(train_steps + 1):
@@ -1066,6 +1251,12 @@ for step in range(train_steps + 1):
             "muon_base_lr": BASE_MUON_LR,
             "muon_lr_mult": args.muon_lr_mult,
             "aux_lr_mult": args.aux_lr_mult,
+            "cooldown_start_offset": args.cooldown_start_offset,
+            "critical_lr_midpoint": None if last_critical_lr_trace is None else last_critical_lr_trace["midpoint_lr"],
+            "critical_lr_lower": None if last_critical_lr_trace is None else last_critical_lr_trace["lower_lr"],
+            "critical_lr_upper": None if last_critical_lr_trace is None else last_critical_lr_trace["upper_lr"],
+            "critical_lr_search_hit_max": None if last_critical_lr_trace is None else last_critical_lr_trace["search_hit_max"],
+            "critical_lr_search_hit_exp_cap": None if last_critical_lr_trace is None else last_critical_lr_trace["search_hit_exp_cap"],
             "stable": True,
         }
         print0("SUMMARY_JSON " + json.dumps(summary, sort_keys=True), console=True)
@@ -1077,6 +1268,7 @@ for step in range(train_steps + 1):
             "step_avg_ms": 1000 * training_time / max(step, 1),
             "warmup_mult": warmup_multiplier(step),
             "muon_lr": optimizer2.param_groups[0]["lr"],
+            "critical_lr_midpoint": -1 if last_critical_lr_trace is None else last_critical_lr_trace["midpoint_lr"],
             "stable": 1,
         }, step)
         model.train()
@@ -1106,6 +1298,7 @@ for step in range(train_steps + 1):
                 "warmup_steps": args.warmup_steps,
                 "muon_lr_mult": args.muon_lr_mult,
                 "aux_lr_mult": args.aux_lr_mult,
+                "critical_lr_midpoint": None if last_critical_lr_trace is None else last_critical_lr_trace["midpoint_lr"],
                 "stable": False,
             }
             print0("SUMMARY_JSON " + json.dumps(summary, sort_keys=True), console=True)
@@ -1117,6 +1310,9 @@ for step in range(train_steps + 1):
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
     # set optimization hyperparameters and take a step
     set_hparams(step)
+    critical_trace = adaptive_critical_lr_for_batch(step, inputs, targets)
+    if critical_trace is not None:
+        last_critical_lr_trace = critical_trace
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)

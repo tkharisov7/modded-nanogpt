@@ -8,6 +8,13 @@ STOP_STEP="${STOP_STEP:-2720}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-64}"
 WARMUP_TARGET="${WARMUP_TARGET:-muon_hidden_only}"
 AUX_LR_MULT="${AUX_LR_MULT:-1.0}"
+FINAL_SCHEDULE_STEPS="${FINAL_SCHEDULE_STEPS:-2900}"
+FINAL_LR_POWER="${FINAL_LR_POWER:-1.2}"
+COOLDOWN_START_OFFSET="${COOLDOWN_START_OFFSET:-0}"
+CRITICAL_LR_SEARCH_MAX="${CRITICAL_LR_SEARCH_MAX:-0.375}"
+CRITICAL_LR_TOL_POWER="${CRITICAL_LR_TOL_POWER:-6}"
+CRITICAL_LR_EXP_MAX_ITERS="${CRITICAL_LR_EXP_MAX_ITERS:-40}"
+CRITICAL_LR_MAX_ITERS="${CRITICAL_LR_MAX_ITERS:-80}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_PROJECT="${WANDB_PROJECT:-modded-nanogpt-track3}"
 WANDB_GROUP="${WANDB_GROUP:-T3_CRITICAL_WARMUP_GH200_${SLURM_ARRAY_JOB_ID:-manual}}"
@@ -45,7 +52,8 @@ add_candidate() {
   local warmup_steps="$2"
   local muon_lr_mult="$3"
   local seed="$4"
-  CANDIDATES+=("${schedule_kind},${warmup_steps},${muon_lr_mult},${seed}")
+  local final_schedule_steps="${5:-${FINAL_SCHEDULE_STEPS}}"
+  CANDIDATES+=("${schedule_kind},${warmup_steps},${muon_lr_mult},${seed},${final_schedule_steps}")
 }
 
 add_cell() {
@@ -102,6 +110,17 @@ case "${GRID_PRESET}" in
     add_cell critical_table 20 1.30
     add_cell critical_table 20 1.40
     ;;
+  adaptive_a_small_v1)
+    for warmup_steps in 10 20; do
+      for muon_lr_mult in 1.05 1.10 1.15; do
+        for cooldown_end_step in 2685 2690; do
+          for seed in 0 1 2; do
+            add_candidate adaptive_critical_lr "${warmup_steps}" "${muon_lr_mult}" "${seed}" "${cooldown_end_step}"
+          done
+        done
+      done
+    done
+    ;;
   *)
     echo "Unsupported GRID_PRESET=${GRID_PRESET}" >&2
     exit 1
@@ -120,6 +139,13 @@ echo "data_dir=${DATA_DIR}"
 echo "run_root=${RUN_ROOT}"
 echo "warmup_target=${WARMUP_TARGET}"
 echo "aux_lr_mult=${AUX_LR_MULT}"
+echo "final_schedule_steps=${FINAL_SCHEDULE_STEPS}"
+echo "final_lr_power=${FINAL_LR_POWER}"
+echo "cooldown_start_offset=${COOLDOWN_START_OFFSET}"
+echo "critical_lr_search_max=${CRITICAL_LR_SEARCH_MAX}"
+echo "critical_lr_tol_power=${CRITICAL_LR_TOL_POWER}"
+echo "critical_lr_exp_max_iters=${CRITICAL_LR_EXP_MAX_ITERS}"
+echo "critical_lr_max_iters=${CRITICAL_LR_MAX_ITERS}"
 echo "stop_step=${STOP_STEP}"
 echo "micro_batch_size=${MICRO_BATCH_SIZE}"
 echo "wandb_mode=${WANDB_MODE}"
@@ -139,9 +165,9 @@ echo "start_index=${START_INDEX}"
 run_candidate() {
   local candidate_index="$1"
   local gpu_slot="$2"
-  IFS=, read -r schedule_kind warmup_steps muon_lr_mult seed <<<"${CANDIDATES[$candidate_index]}"
+  IFS=, read -r schedule_kind warmup_steps muon_lr_mult seed final_schedule_steps <<<"${CANDIDATES[$candidate_index]}"
 
-  local wandb_name="${schedule_kind}_w${warmup_steps}_m${muon_lr_mult}_seed${seed}_${SLURM_ARRAY_JOB_ID:-manual}_${candidate_index}"
+  local wandb_name="${schedule_kind}_w${warmup_steps}_m${muon_lr_mult}_c${final_schedule_steps}_seed${seed}_${SLURM_ARRAY_JOB_ID:-manual}_${candidate_index}"
   local log_file="${RUN_ROOT}/logs/${wandb_name}.log"
   local wandb_dir
   local wandb_cache_dir
@@ -155,7 +181,7 @@ run_candidate() {
   fi
   mkdir -p "${wandb_dir}" "${wandb_cache_dir}"
 
-  echo "[$(date --iso-8601=seconds)] launching candidate_index=${candidate_index} gpu_slot=${gpu_slot} schedule_kind=${schedule_kind} warmup_steps=${warmup_steps} muon_lr_mult=${muon_lr_mult} seed=${seed} log_file=${log_file}"
+  echo "[$(date --iso-8601=seconds)] launching candidate_index=${candidate_index} gpu_slot=${gpu_slot} schedule_kind=${schedule_kind} warmup_steps=${warmup_steps} muon_lr_mult=${muon_lr_mult} final_schedule_steps=${final_schedule_steps} seed=${seed} log_file=${log_file}"
 
   local train_cmd=(
     python -m torch.distributed.run --standalone --nproc_per_node=1
@@ -166,6 +192,13 @@ run_candidate() {
     --warmup-target "${WARMUP_TARGET}"
     --muon-lr-mult "${muon_lr_mult}"
     --aux-lr-mult "${AUX_LR_MULT}"
+    --final-schedule-steps "${final_schedule_steps}"
+    --final-lr-power "${FINAL_LR_POWER}"
+    --cooldown-start-offset "${COOLDOWN_START_OFFSET}"
+    --critical-lr-search-max "${CRITICAL_LR_SEARCH_MAX}"
+    --critical-lr-tol-power "${CRITICAL_LR_TOL_POWER}"
+    --critical-lr-exp-max-iters "${CRITICAL_LR_EXP_MAX_ITERS}"
+    --critical-lr-max-iters "${CRITICAL_LR_MAX_ITERS}"
     --stop-step "${STOP_STEP}"
     --data-dir "${DATA_DIR}"
     --micro-batch-size "${MICRO_BATCH_SIZE}"
